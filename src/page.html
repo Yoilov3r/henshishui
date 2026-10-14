@@ -35,6 +35,47 @@
     touch-action: pan-y;
   }
   #spacer { position: relative; width: 100%; pointer-events: none; }
+  #chrome {
+    position: fixed;
+    left: 14px;
+    bottom: 14px;
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: system-ui, "Microsoft YaHei", sans-serif;
+  }
+  #chrome .ctl {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 30px;
+    padding: 0 10px;
+    border-radius: 8px;
+    border: 1px solid rgba(190, 214, 214, 0.16);
+    background: rgba(6, 14, 18, 0.42);
+    color: rgba(214, 228, 226, 0.62);
+    font-size: 12px;
+    line-height: 1;
+    letter-spacing: 0;
+    text-decoration: none;
+    cursor: pointer;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    transition: color 220ms ease, border-color 220ms ease, background 220ms ease;
+  }
+  #chrome .ctl:hover, #chrome .ctl:focus-visible {
+    color: rgba(238, 246, 244, 0.95);
+    border-color: rgba(214, 236, 234, 0.42);
+    background: rgba(10, 22, 27, 0.62);
+    outline: none;
+  }
+  #chrome .ctl svg { width: 15px; height: 15px; flex: none; }
+  #sound { padding: 0 8px; }
+  #sound .ico-on { display: none; }
+  #sound[data-on="1"] .ico-on { display: inline; }
+  #sound[data-on="1"] .ico-off { display: none; }
+  #sound[data-on="1"] { color: rgba(238, 246, 244, 0.9); }
   .sr-only {
     position: absolute;
     width: 1px; height: 1px;
@@ -54,7 +95,15 @@
 <canvas id="scene" aria-hidden="true"></canvas>
 <div id="spacer"></div>
 <div class="sr-only" id="libretto"></div>
+<nav id="chrome">
+  <button id="sound" class="ctl" type="button" hidden data-on="0" aria-pressed="false" title="开启雷声">
+    <svg class="ico-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="22" x2="16" y1="9" y2="15"></line><line x1="16" x2="22" y1="9" y2="15"></line></svg>
+    <svg class="ico-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>
+  </button>
+  <a id="alt" class="ctl" href="__ALT_HREF__" title="切换到__ALT_LABEL__">__ALT_LABEL__<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg></a>
+</nav>
 <script>__POEMS_JS__</script>
+<script>__AUDIO_JS__</script>
 <script>__SCENE_JS__</script>
 <script>
 (function () {
@@ -63,10 +112,45 @@
   var spacer = document.getElementById('spacer');
   var params = new URLSearchParams(location.search);
   var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var MODE = '__MODE__';
   var still = params.get('still') === '1';
   var forcedT = params.has('t') ? parseFloat(params.get('t')) : null;
   var forcedLevel = params.has('level') ? parseFloat(params.get('level')) : null;
   var engine = null, last = 0, running = false;
+  var audio = null, soundBtn = document.getElementById('sound');
+
+  function refreshSound() {
+    if (!soundBtn) return;
+    var on = !!(audio && audio.isOn());
+    soundBtn.setAttribute('data-on', on ? '1' : '0');
+    soundBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    soundBtn.title = on ? '关闭雷声' : '开启雷声';
+  }
+
+  function setupAudio() {
+    if (MODE !== 'storm' || !window.RainAudio || !window.RainAudio.available() || !soundBtn) return;
+    audio = window.RainAudio.create();
+    soundBtn.hidden = false;
+    refreshSound();
+    soundBtn.addEventListener('pointerdown', function (e) { e.stopPropagation(); });
+    soundBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (audio.isOn()) { audio.disable(); audio.userMuted = true; }
+      else { audio.enable(); audio.userMuted = false; }
+      refreshSound();
+    });
+    function firstGesture() {
+      if (!audio.userMuted && !audio.isOn()) { audio.enable(); refreshSound(); }
+    }
+    window.addEventListener('pointerdown', firstGesture, { passive: true });
+    window.addEventListener('keydown', firstGesture);
+    document.addEventListener('visibilitychange', function () { audio.setHidden(document.hidden); });
+  }
+
+  function onStrike(evt) {
+    if (audio && audio.isOn()) audio.thunder(evt.distance, evt.power);
+  }
 
   function readViewport() {
     var vv = window.visualViewport;
@@ -140,14 +224,18 @@
         title: '"TitleXing", "STXingkai", "KaiTi", serif',
         fallback: '"KaiTi", "STKaiti", "Kaiti SC", serif'
       },
-      reducedMotion: reduced
+      mode: MODE,
+      reducedMotion: reduced,
+      onStrike: onStrike
     });
+    setupAudio();
     var v = readViewport();
     var info = engine.resize(v.w, v.h, v.dpr);
     applyLayout(info);
     if (forcedLevel !== null) engine.setElapsed(window.RainScene.timeForLevel(forcedLevel));
     else if (forcedT !== null) engine.setElapsed(forcedT);
     engine.simulate(still ? 6 : 3.2);
+    if (still && params.get('bolt') === '1') engine.strike();
     canvas.classList.add('ready');
     window.__rainEngine = engine;
     buildLibretto();

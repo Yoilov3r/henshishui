@@ -8,6 +8,20 @@
   var POOL_AT = 30;      // 秒：开始积水
   var FULL_AT = 600;     // 秒：灌满整屏
 
+  /* 两种形态：细雨沉沦 / 狂风骤雨（后者含雷电与书帛撕裂） */
+  var MODES = {
+    calm: {
+      poolAt: POOL_AT, fullAt: FULL_AT, exponent: 1.12,
+      rainDensity: 1, rainSpeed: 1, rainLen: 1, rainAlpha: 1, wind: 1, wave: 1, spray: 1,
+      fog: 1, lightning: false, crackAt: Infinity
+    },
+    storm: {
+      poolAt: 3, fullAt: 10, exponent: 0.95,
+      rainDensity: 1.8, rainSpeed: 1.4, rainLen: 1.55, rainAlpha: 1.3, wind: 3.0, wave: 2.1, spray: 1.7,
+      fog: 1.5, lightning: true, crackAt: 10, crackFullAt: 45
+    }
+  };
+
   /* ---------------------------------------------------------------- 工具 */
 
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
@@ -465,10 +479,11 @@
     ];
   }
 
-  function drawLanterns(ctx, lanterns, t, dim, glowWarm) {
+  function drawLanterns(ctx, lanterns, t, dim, glowWarm, gust) {
+    gust = gust || 1;
     for (var i = 0; i < lanterns.length; i++) {
       var L = lanterns[i];
-      var sway = Math.sin(t * 0.55 + L.phase) * 0.028 + Math.sin(t * 1.31 + L.phase * 1.7) * 0.012;
+      var sway = (Math.sin(t * 0.55 + L.phase) * 0.028 + Math.sin(t * 1.31 + L.phase * 1.7) * 0.012) * gust;
       var x = L.x + sway * 60;
       var y = L.y;
       var s = L.size;
@@ -521,8 +536,12 @@
     { share: 0.10, speed: [950, 1280], len: [30, 66], width: 1.9, alpha: 0.30, wind: 1.0, splash: 1.0 }
   ];
 
-  function windAt(t) {
-    return -30 + 30 * Math.sin(t * 0.105) + 16 * Math.sin(t * 0.335 + 1.7) + 8 * Math.sin(t * 0.94 + 0.4);
+  function windAt(t, conf) {
+    var base = -30 + 30 * Math.sin(t * 0.105) + 16 * Math.sin(t * 0.335 + 1.7) + 8 * Math.sin(t * 0.94 + 0.4);
+    if (!conf || conf.wind === 1) return base;
+    var gust = 84 * Math.sin(t * 0.285) + 44 * Math.sin(t * 0.72 + 1.3)
+      + 21 * Math.sin(t * 1.68 + 0.5) + 11 * Math.sin(t * 3.13 + 2.2);
+    return base + gust;
   }
 
   /* ----------------------------------------------------------- 引擎主体 */
@@ -535,8 +554,12 @@
     var families = opts.families || { poem: 'serif', title: 'serif' };
     var seed = opts.seed || 20261014;
     var reduced = !!opts.reducedMotion;
+    var conf = MODES[opts.mode] || MODES.calm;
+    var onStrike = opts.onStrike || null;
     var w = 100, h = 100, dpr = 1;
-    var ctx = canvas.getContext('2d');
+    var mainCtx = canvas.getContext('2d');
+    var ctx = mainCtx;
+    var tearCanvas = null, tearCtx = null;
     var rand = makeRand(seed);
     var layout = null, textLayer = null, backdrop = null;
     var scratch = makeCanvas(4, 4);
@@ -551,9 +574,9 @@
     var postLayer = null, waterStrip = null, glowCool = null, glowWarm = null;
 
     function levelFor(sec) {
-      if (sec <= POOL_AT) return 0;
-      var u = clamp((sec - POOL_AT) / (FULL_AT - POOL_AT), 0, 1);
-      return Math.pow(u, 1.12);
+      if (sec <= conf.poolAt) return 0;
+      var u = clamp((sec - conf.poolAt) / (conf.fullAt - conf.poolAt), 0, 1);
+      return Math.pow(u, conf.exponent);
     }
 
     function buildNoise() {
@@ -665,7 +688,7 @@
 
     function dropTarget() {
       var base = clamp((w * h) / 2450, 220, 900);
-      return Math.round(base * density * (reduced ? 0.55 : 1));
+      return Math.round(base * density * conf.rainDensity * (reduced ? 0.55 : 1));
     }
 
     function makeDrop(layerIdx, initial) {
@@ -674,9 +697,9 @@
         layer: layerIdx,
         x: rand() * (w + 240) - 120,
         y: initial ? rand() * (h * 1.0) : -rand() * (h * 0.4) - 14,
-        speed: lerp(L.speed[0], L.speed[1], rand()),
-        len: lerp(L.len[0], L.len[1], rand()),
-        jitter: (rand() - 0.5) * 34
+        speed: lerp(L.speed[0], L.speed[1], rand()) * conf.rainSpeed,
+        len: lerp(L.len[0], L.len[1], rand()) * conf.rainLen,
+        jitter: (rand() - 0.5) * 34 * (1 + (conf.wind - 1) * 0.55)
       };
     }
 
@@ -704,7 +727,14 @@
         canvas.style.height = h + 'px';
       }
       ctx = canvas.getContext('2d');
+      mainCtx = ctx;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      if (isFinite(conf.crackAt)) {
+        tearCanvas = makeCanvas(canvas.width, canvas.height);
+        tearCtx = tearCanvas.getContext('2d');
+        tearCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        fragments = buildFragments();
+      }
       rebuild();
       updateSurface();
       return layout;
@@ -717,7 +747,7 @@
       var n = profile.length;
       var step = w / (n - 1);
       profileStep = step;
-      var amp = level > 0.002 ? (1.0 + 2.8 * level) : 0;
+      var amp = level > 0.002 ? (1.0 + 2.8 * level) * conf.wave : 0;
       for (var i = 0; i < n; i++) {
         var x = i * step;
         var y = waterY;
@@ -755,14 +785,15 @@
     function spawnSplash(x, y, strength, impact) {
       var onFloor = level <= 0.002;
       var lift = onFloor ? 1.75 : 1;
-      var count = Math.round((onFloor ? 4 : 2) + 4.5 * strength + rand() * 2);
+      var spray = conf.spray;
+      var count = Math.round(((onFloor ? 4 : 2) + 4.5 * strength + rand() * 2) * spray);
       for (var i = 0; i < count; i++) {
         var ang = (rand() - 0.5) * 2.6;
-        var sp = (34 + 150 * strength) * lerp(0.5, 1.25, rand());
+        var sp = (34 + 150 * strength) * lerp(0.5, 1.25, rand()) * spray;
         splashes.push({
           x: x + (rand() - 0.5) * 3,
           y: y - 1,
-          vx: Math.sin(ang) * sp + windAt(animT) * 0.5,
+          vx: Math.sin(ang) * sp + windAt(animT, conf) * 0.5,
           vy: (-Math.abs(Math.cos(ang)) * sp * 1.05 - impact * 40 * rand()) * lift,
           life: 0.24 + rand() * 0.55,
           t: 0,
@@ -771,19 +802,19 @@
         });
       }
       if (level > 0.02) {
-        ripples.push({ x: x, t: 0, life: 0.5 + rand() * 0.65, maxR: 14 + 46 * strength, amp: 0.6 + strength });
+        ripples.push({ x: x, t: 0, life: 0.5 + rand() * 0.65, maxR: (14 + 46 * strength) * (0.8 + conf.wave * 0.4), amp: (0.6 + strength) * conf.wave });
         if (ripples.length > 90) ripples.shift();
       }
       crowns.push({
         x: x, y: y, t: 0, life: 0.16 + rand() * 0.12,
-        h: (5 + 15 * strength) * (onFloor ? 1.9 : 1),
+        h: (5 + 15 * strength) * (onFloor ? 1.9 : 1) * (0.85 + conf.spray * 0.35),
         w: (3 + 4 * rand()) * (onFloor ? 1.3 : 1),
         a: 0.25 + 0.4 * strength
       });
     }
 
     function stepSim(dt) {
-      var wind = windAt(animT);
+      var wind = windAt(animT, conf);
       var i, d;
       for (i = 0; i < drops.length; i++) {
         d = drops[i];
@@ -832,9 +863,234 @@
       }
       if (drops.length !== dropTarget()) seedDrops(false);
       stepSim(dt);
+      updateStorm(dt);
       avgDt = avgDt * 0.94 + dt * 1000 * 0.06;
       if (avgDt > 26 && density > 0.55) density = Math.max(0.55, density - 0.012);
       else if (avgDt < 15 && density < 1) density = Math.min(1, density + 0.006);
+    }
+
+    /* ------------------------------------------------------- 电闪雷鸣 */
+
+    var bolts = [], flash = 0, strikeTimer = 1.1;
+
+    function boltPath(x0, y0, x1, y1, rnd) {
+      var pts = [[x0, y0], [x1, y1]];
+      var disp = Math.abs(y1 - y0) * 0.24 + 8;
+      for (var it = 0; it < 5; it++) {
+        var next = [pts[0]];
+        for (var i = 1; i < pts.length; i++) {
+          var a = pts[i - 1], b = pts[i];
+          next.push([(a[0] + b[0]) / 2 + (rnd() - 0.5) * disp, (a[1] + b[1]) / 2 + (rnd() - 0.5) * disp * 0.22]);
+          next.push(b);
+        }
+        pts = next;
+        disp *= 0.54;
+      }
+      return pts;
+    }
+
+    function spawnBolt() {
+      var rnd = rand;
+      var x0 = w * (0.06 + rnd() * 0.88);
+      var x1 = clamp(x0 + (rnd() - 0.5) * w * 0.34, w * 0.03, w * 0.97);
+      var y1 = h * (0.26 + rnd() * 0.36);
+      var main = boltPath(x0, -40, x1, y1, rnd);
+      var branches = [];
+      var bn = rnd() < 0.78 ? (rnd() < 0.42 ? 2 : 1) : 0;
+      for (var i = 0; i < bn; i++) {
+        var from = main[Math.floor(main.length * (0.25 + rnd() * 0.5))];
+        branches.push(boltPath(
+          from[0], from[1],
+          from[0] + (rnd() - 0.5) * w * 0.24,
+          from[1] + h * (0.10 + rnd() * 0.18),
+          rnd
+        ));
+      }
+      var power = 0.45 + rnd() * 0.55;
+      bolts.push({ pts: main, branches: branches, t: 0, life: 0.13 + rnd() * 0.14, power: power });
+      if (bolts.length > 4) bolts.shift();
+      flash = Math.max(flash, power);
+      if (onStrike) onStrike({ distance: rnd(), power: power });
+      strikeTimer = rnd() < 0.34 ? (0.08 + rnd() * 0.18) : (0.7 + rnd() * 2.0);
+    }
+
+    function updateStorm(dt) {
+      if (!conf.lightning) return;
+      strikeTimer -= dt;
+      if (strikeTimer <= 0) spawnBolt();
+      for (var i = bolts.length - 1; i >= 0; i--) {
+        bolts[i].t += dt;
+        if (bolts[i].t >= bolts[i].life) bolts.splice(i, 1);
+      }
+      flash *= Math.pow(0.0009, dt);
+      if (flash < 0.002) flash = 0;
+    }
+
+    function traceBolt(paths) {
+      for (var p = 0; p < paths.length; p++) {
+        var list = paths[p];
+        for (var i = 0; i < list.length; i++) {
+          if (i === 0) ctx.moveTo(list[i][0], list[i][1]);
+          else ctx.lineTo(list[i][0], list[i][1]);
+        }
+      }
+    }
+
+    function drawBolts() {
+      if (!bolts.length) return;
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (var i = 0; i < bolts.length; i++) {
+        var b = bolts[i];
+        var a = Math.pow(1 - b.t / b.life, 0.6) * b.power;
+        if (a <= 0.012) continue;
+        ctx.beginPath();
+        traceBolt([b.pts].concat(b.branches));
+        ctx.strokeStyle = 'rgba(138,178,222,' + (0.14 * a).toFixed(3) + ')';
+        ctx.lineWidth = 8;
+        ctx.stroke();
+        ctx.strokeStyle = 'rgba(196,222,246,' + (0.5 * a).toFixed(3) + ')';
+        ctx.lineWidth = 2.6;
+        ctx.stroke();
+        ctx.strokeStyle = 'rgba(242,249,255,' + (0.92 * a).toFixed(3) + ')';
+        ctx.lineWidth = 0.9;
+        ctx.stroke();
+        var end = b.pts[b.pts.length - 1];
+        ctx.globalAlpha = 0.45 * a;
+        ctx.drawImage(glowCool, end[0] - w * 0.24, end[1] - h * 0.15, w * 0.48, h * 0.30);
+        ctx.globalAlpha = 1;
+      }
+      ctx.restore();
+    }
+
+    function drawFlash() {
+      if (flash <= 0.012) return;
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = 'rgba(124,156,204,' + (flash * 0.15).toFixed(3) + ')';
+      ctx.fillRect(0, 0, w, h);
+      for (var i = 0; i < bolts.length; i++) {
+        var b = bolts[i];
+        var k = 1 - b.t / b.life;
+        ctx.globalAlpha = 0.5 * k * b.power;
+        ctx.drawImage(glowCool, b.pts[0][0] - w * 0.5, -h * 0.4, w, h * 0.95);
+      }
+      ctx.restore();
+    }
+
+    /* --------------------------------------------- 灌满后：书帛撕裂 */
+
+    var fragments = null;
+
+    function tearProgress() {
+      if (!isFinite(conf.crackAt)) return 0;
+      return clamp((t - conf.crackAt) / Math.max(0.001, conf.crackFullAt - conf.crackAt), 0, 1);
+    }
+
+    function jaggedRect(x0, y0, x1, y1, rnd, amp) {
+      var pts = [];
+      function walk(ax, ay, bx, by) {
+        var dx = bx - ax, dy = by - ay;
+        var len = Math.sqrt(dx * dx + dy * dy);
+        var steps = Math.max(3, Math.round(len / 17));
+        var nx = -dy / len, ny = dx / len;
+        for (var i = 0; i < steps; i++) {
+          var s = i / steps;
+          var off = (rnd() - 0.5) * amp;
+          pts.push([ax + dx * s + nx * off, ay + dy * s + ny * off]);
+        }
+      }
+      walk(x0, y0, x1, y0);
+      walk(x1, y0, x1, y1);
+      walk(x1, y1, x0, y1);
+      walk(x0, y1, x0, y0);
+      return pts;
+    }
+
+    /* 不均匀的裂口位置：同一轴上的分界线带随机偏移，避免出现规则网格 */
+    function splitAxis(total, count, rnd, variance) {
+      var unit = total / count;
+      var edges = [0];
+      for (var i = 1; i < count; i++) {
+        var jitter = (rnd() - 0.5) * unit * variance;
+        var v = clamp((i / count) * total + jitter, edges[i - 1] + unit * 0.40, total - (count - i) * unit * 0.42);
+        edges.push(v);
+      }
+      edges.push(total);
+      return edges;
+    }
+
+    function buildFragments() {
+      var rnd = makeRand(seed + 909);
+      var cols = clamp(Math.round(w / 172), 4, 12);
+      var rows = clamp(Math.round(h / 172), 3, 9);
+      var xs = splitAxis(w, cols, rnd, 1.5);
+      var ys = splitAxis(h, rows, rnd, 1.5);
+      var list = [];
+      for (var r = 0; r < rows; r++) {
+        for (var c = 0; c < cols; c++) {
+          var x0 = xs[c], x1 = xs[c + 1];
+          var y0 = ys[r], y1 = ys[r + 1];
+          var amp = Math.min(13, (x1 - x0) * 0.12, (y1 - y0) * 0.12);
+          var cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+          var ox = (cx - w / 2) / (w / 2), oy = (cy - h / 2) / (h / 2);
+          list.push({
+            poly: jaggedRect(x0, y0, x1, y1, rnd, amp * 1.8),
+            cx: cx, cy: cy,
+            vx: ox * (30 + rnd() * 52) + (rnd() - 0.5) * 34,
+            vy: oy * (20 + rnd() * 38) + 18 + rnd() * 34,
+            rot: (rnd() - 0.5) * 0.9,
+            alpha: 0.72 + rnd() * 0.28
+          });
+        }
+      }
+      return list;
+    }
+
+    function compositeTorn(p) {
+      var ease = p * p * (3 - 2 * p);
+      var drift = Math.pow(p, 0.72) * (1 + 1.6 * p);
+      var shrink = 1 - 0.075 * p;
+      var voidGrad = ctx.createLinearGradient(0, 0, 0, h);
+      voidGrad.addColorStop(0, '#010406');
+      voidGrad.addColorStop(0.62, '#02090d');
+      voidGrad.addColorStop(1, '#04141a');
+      ctx.fillStyle = voidGrad;
+      ctx.fillRect(0, 0, w, h);
+      drawGlow(glowCool, w * 0.5, h * 0.46, w * 0.6, h * 0.52, 0.035 + 0.05 * (1 - p), 0);
+      var src = tearCanvas;
+      for (var i = 0; i < fragments.length; i++) {
+        var f = fragments[i];
+        var a = f.alpha * (1 - 0.55 * Math.pow(p, 0.8)) + 0.06 * p;
+        if (a <= 0.02) continue;
+        ctx.save();
+        ctx.globalAlpha = Math.min(1, a);
+        ctx.translate(f.cx + f.vx * drift, f.cy + f.vy * drift);
+        ctx.rotate(f.rot * drift * 0.55);
+        ctx.scale(shrink, shrink);
+        ctx.translate(-f.cx, -f.cy);
+        var poly = f.poly;
+        ctx.beginPath();
+        ctx.moveTo(poly[0][0], poly[0][1]);
+        for (var j = 1; j < poly.length; j++) ctx.lineTo(poly[j][0], poly[j][1]);
+        ctx.closePath();
+        ctx.clip();
+        ctx.drawImage(src, 0, 0, src.width, src.height, 0, 0, w, h);
+        if (p > 0.03) {
+          ctx.fillStyle = 'rgba(74,48,30,' + (0.42 * p).toFixed(3) + ')';
+          ctx.fillRect(0, 0, w, h);
+          ctx.globalCompositeOperation = 'lighter';
+          ctx.fillStyle = 'rgba(40,33,23,' + (0.78 * p).toFixed(3) + ')';
+          ctx.fillRect(0, 0, w, h);
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.strokeStyle = 'rgba(238,226,198,' + (0.38 * p * f.alpha).toFixed(3) + ')';
+          ctx.lineWidth = 1.3;
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
     }
 
     /* --------------------------------------------------------------- 绘制 */
@@ -877,7 +1133,8 @@
       if (depth > 10) {
         ctx.save();
         ctx.clip();
-        for (var b = 0; b < 3; b++) {
+        var blobs = conf.crackAt < 1e9 && t > conf.crackAt ? 2 : 3;
+        for (var b = 0; b < blobs; b++) {
           var phase = animT * (0.10 + b * 0.035) + b * 2.1;
           var by = waterY + depth * (0.16 + 0.26 * b) + Math.sin(phase) * depth * 0.05;
           var bx = w * 0.5 + Math.sin(phase * 0.8) * w * 0.3;
@@ -985,7 +1242,7 @@
     }
 
     function drawRain(layerIdx) {
-      var wind = windAt(animT);
+      var wind = windAt(animT, conf);
       var L = RAIN_LAYERS[layerIdx];
       var count = 0;
       ctx.beginPath();
@@ -998,14 +1255,14 @@
         count++;
       }
       if (!count) return;
-      ctx.strokeStyle = 'rgba(196,224,228,' + L.alpha.toFixed(3) + ')';
+      ctx.strokeStyle = 'rgba(196,224,228,' + Math.min(0.9, L.alpha * conf.rainAlpha).toFixed(3) + ')';
       ctx.lineWidth = L.width;
       ctx.lineCap = 'butt';
       ctx.stroke();
     }
 
     function drawRainBelow(layerIdx, alphaScale) {
-      var wind = windAt(animT);
+      var wind = windAt(animT, conf);
       var L = RAIN_LAYERS[layerIdx];
       var count = 0;
       ctx.beginPath();
@@ -1019,7 +1276,7 @@
         count++;
       }
       if (!count) return;
-      ctx.strokeStyle = 'rgba(150,206,208,' + (L.alpha * alphaScale).toFixed(3) + ')';
+      ctx.strokeStyle = 'rgba(150,206,208,' + Math.min(0.9, L.alpha * alphaScale * conf.rainAlpha).toFixed(3) + ')';
       ctx.lineWidth = L.width;
       ctx.lineCap = 'butt';
       ctx.stroke();
@@ -1041,11 +1298,12 @@
     }
 
     function drawFog() {
+      var k = conf.fog;
       for (var i = 0; i < 2; i++) {
         var ph = i * 2.4;
         var cx = (w * (0.24 + 0.34 * i) + Math.sin(animT * 0.045 + ph) * w * 0.28 + w) % (w * 1.6) - w * 0.3;
         var cy = h * (0.32 + 0.2 * i) + Math.sin(animT * 0.06 + ph) * h * 0.03;
-        drawGlow(glowCool, cx, cy, Math.max(w, h) * 0.34, Math.max(w, h) * 0.14, 0.062 - i * 0.014, 0);
+        drawGlow(glowCool, cx, cy, Math.max(w, h) * 0.34, Math.max(w, h) * 0.14, (0.062 - i * 0.014) * k, 0);
       }
     }
 
@@ -1144,15 +1402,12 @@
       if (postLayer) ctx.drawImage(postLayer, 0, 0, postLayer.width, postLayer.height, 0, 0, w, h);
     }
 
-    function draw() {
-      updateSurface();
+    function drawScene() {
       var dim = 1 - 0.72 * clamp((level - 0.25) / 0.75, 0, 1);
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.globalAlpha = 1;
       ctx.drawImage(backdrop, 0, 0, backdrop.width, backdrop.height, 0, 0, w, h);
       drawFog();
-      drawLanterns(ctx, lanterns, animT, dim, glowWarm);
+      if (conf.lightning) drawBolts();
+      drawLanterns(ctx, lanterns, animT, dim, glowWarm, 1 + (conf.wind - 1) * 0.45);
       ctx.save();
       clipWaterRegion(false);
       drawRain(0);
@@ -1197,6 +1452,26 @@
         }
       }
       drawDeepEffects();
+    }
+
+    function draw() {
+      updateSurface();
+      var p = tearProgress();
+      ctx = (p > 0 && tearCtx) ? tearCtx : mainCtx;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
+      drawScene();
+      if (p > 0 && tearCtx) {
+        ctx = mainCtx;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = 1;
+        compositeTorn(p);
+      }
+      ctx = mainCtx;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      drawFlash();
       drawPost();
     }
 
@@ -1212,6 +1487,7 @@
       setElapsed: function (sec) { t = sec; level = levelFor(sec); updateSurface(); },
       setScroll: function (y) { scrollY = y || 0; },
       setAnimTime: function (sec) { animT = sec; },
+      strike: function () { if (conf.lightning) spawnBolt(); },
       level: function () { return level; },
       info: function () {
         return layout ? {
@@ -1221,7 +1497,11 @@
         } : null;
       },
       state: function () {
-        return { t: t, level: level, waterY: waterY, drops: drops.length, splashes: splashes.length, ripples: ripples.length, density: density };
+        return {
+          t: t, level: level, waterY: waterY, drops: drops.length, splashes: splashes.length,
+          ripples: ripples.length, density: density, mode: conf === MODES.storm ? 'storm' : 'calm',
+          flash: flash, bolts: bolts.length, tear: tearProgress()
+        };
       }
     };
 

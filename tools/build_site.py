@@ -9,34 +9,63 @@ ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "site"
 OUT_DIRS = [ROOT / "repo", ROOT.parent / "outputs" / "henshishui"]
 
+# 两个版本共用一套引擎与模板
+VARIANTS = [
+    {
+        "file": "index.html",
+        "mode": "calm",
+        "alt_file": "storm.html",
+        "alt_label": "狂风骤雨版",
+        "audio": False,
+    },
+    {
+        "file": "storm.html",
+        "mode": "storm",
+        "alt_file": "index.html",
+        "alt_label": "细雨沉沦版",
+        "audio": True,
+    },
+]
+
 
 def main() -> int:
     template = (SITE / "src" / "page.html").read_text(encoding="utf-8")
     poems_js = (SITE / "src" / "poems.js").read_text(encoding="utf-8")
     scene_js = (SITE / "src" / "scene.js").read_text(encoding="utf-8")
+    audio_js = (SITE / "src" / "audio.js").read_text(encoding="utf-8")
     poem_font = base64.b64encode((ROOT / "build" / "poem.woff2").read_bytes()).decode("ascii")
     title_font = base64.b64encode((ROOT / "build" / "title.woff2").read_bytes()).decode("ascii")
 
-    html = template
-    html = html.replace("__FONT_POEM__", poem_font)
-    html = html.replace("__FONT_TITLE__", title_font)
-    html = html.replace("__POEMS_JS__", poems_js)
-    html = html.replace("__SCENE_JS__", scene_js)
-    for token in ["__FONT_POEM__", "__FONT_TITLE__", "__POEMS_JS__", "__SCENE_JS__"]:
-        assert token not in html, f"unreplaced placeholder: {token}"
+    def render(variant: dict) -> str:
+        html = template
+        html = html.replace("__FONT_POEM__", poem_font)
+        html = html.replace("__FONT_TITLE__", title_font)
+        html = html.replace("__POEMS_JS__", poems_js)
+        html = html.replace("__SCENE_JS__", scene_js)
+        html = html.replace("__AUDIO_JS__", audio_js if variant["audio"] else "")
+        html = html.replace("__MODE__", variant["mode"])
+        html = html.replace("__ALT_HREF__", variant["alt_file"])
+        html = html.replace("__ALT_LABEL__", variant["alt_label"])
+        for token in [
+            "__FONT_POEM__", "__FONT_TITLE__", "__POEMS_JS__", "__SCENE_JS__",
+            "__AUDIO_JS__", "__MODE__", "__ALT_HREF__", "__ALT_LABEL__",
+        ]:
+            assert token not in html, f"unreplaced placeholder: {token}"
+        return html
 
     for out_dir in OUT_DIRS:
         out_dir.mkdir(parents=True, exist_ok=True)
-        target = out_dir / "index.html"
-        target.write_text(html, encoding="utf-8")
-        print(f"{target}: {target.stat().st_size / 1024:.1f} KB")
+        for variant in VARIANTS:
+            target = out_dir / variant["file"]
+            target.write_text(render(variant), encoding="utf-8")
+            print(f"{target}: {target.stat().st_size / 1024:.1f} KB")
 
     # 仓库里同时保留可读源码，便于二次修改
     repo = ROOT / "repo"
     (repo / "src").mkdir(parents=True, exist_ok=True)
     (repo / "tools").mkdir(parents=True, exist_ok=True)
     (repo / "src" / "fonts").mkdir(parents=True, exist_ok=True)
-    for name in ["page.html", "poems.js", "scene.js"]:
+    for name in ["page.html", "poems.js", "scene.js", "audio.js"]:
         shutil.copyfile(SITE / "src" / name, repo / "src" / name)
     shutil.copyfile(ROOT / "build" / "poem.woff2", repo / "src" / "fonts" / "poem.woff2")
     shutil.copyfile(ROOT / "build" / "title.woff2", repo / "src" / "fonts" / "title.woff2")
