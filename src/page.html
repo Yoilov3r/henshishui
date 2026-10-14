@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="阴雨不歇，水位自涨。两篇戏文《恨逝水》《纂事近》，行楷竖排，随积水一寸寸沉入水中。">
+<title>恨逝水 · 纂事近</title>
+<style>
+  @font-face {
+    font-family: 'PoemKai';
+    src: url(data:font/woff2;base64,__FONT_POEM__) format('woff2');
+    font-display: block;
+  }
+  @font-face {
+    font-family: 'TitleXing';
+    src: url(data:font/woff2;base64,__FONT_TITLE__) format('woff2');
+    font-display: block;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #04070a;
+    color: #e9efe8;
+    -webkit-font-smoothing: antialiased;
+  }
+  html { overflow: hidden; height: 100%; }
+  body { height: 100%; overflow: hidden; }
+  body.scrollable { overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
+  #scene {
+    position: fixed;
+    left: 0;
+    top: 0;
+    display: block;
+    touch-action: pan-y;
+  }
+  #spacer { position: relative; width: 100%; pointer-events: none; }
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+  /* 字体就绪前不闪白 */
+  #scene { opacity: 0; transition: opacity 900ms ease; }
+  #scene.ready { opacity: 1; }
+</style>
+</head>
+<body>
+<canvas id="scene" aria-hidden="true"></canvas>
+<div id="spacer"></div>
+<div class="sr-only" id="libretto"></div>
+<script>__POEMS_JS__</script>
+<script>__SCENE_JS__</script>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('scene');
+  var spacer = document.getElementById('spacer');
+  var params = new URLSearchParams(location.search);
+  var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var still = params.get('still') === '1';
+  var forcedT = params.has('t') ? parseFloat(params.get('t')) : null;
+  var forcedLevel = params.has('level') ? parseFloat(params.get('level')) : null;
+  var engine = null, last = 0, running = false;
+
+  function readViewport() {
+    var vv = window.visualViewport;
+    var w = Math.round(window.innerWidth || (vv && vv.width) || 1024);
+    var h = Math.round(window.innerHeight || (vv && vv.height) || 768);
+    return { w: Math.max(300, w), h: Math.max(300, h), dpr: Math.min(2, window.devicePixelRatio || 1) };
+  }
+
+  function applyLayout(info) {
+    if (info.mode === 'wrap') {
+      document.body.classList.add('scrollable');
+      document.documentElement.classList.add('scrollable');
+      document.documentElement.style.height = 'auto';
+      document.body.style.height = 'auto';
+      spacer.style.height = info.docHeight + 'px';
+    } else {
+      document.body.classList.remove('scrollable');
+      document.documentElement.classList.remove('scrollable');
+      document.documentElement.style.height = '100%';
+      document.body.style.height = '100%';
+      spacer.style.height = '0px';
+      if (window.scrollY) window.scrollTo(0, 0);
+    }
+    engine.setScroll(window.scrollY || 0);
+  }
+
+  function resize() {
+    if (!engine) return;
+    var v = readViewport();
+    var keep = engine.level();
+    var info = engine.resize(v.w, v.h, v.dpr);
+    engine.setElapsed(engine.state().t);
+    applyLayout(info);
+    if (forcedLevel !== null) engine.setElapsed(window.RainScene.timeForLevel(forcedLevel));
+    else if (keep > 0) { /* 保持当前水位 */ }
+  }
+
+  function frame(now) {
+    if (!running) return;
+    if (!last) last = now;
+    var dt = (now - last) / 1000;
+    last = now;
+    if (document.hidden) dt = 0;
+    if (dt > 0.25) dt = 0.25;
+    if (!still) engine.advance(dt);
+    engine.draw();
+    if (still) { running = false; return; }
+    requestAnimationFrame(frame);
+  }
+
+  function buildLibretto() {
+    var host = document.getElementById('libretto');
+    var frag = document.createDocumentFragment();
+    (window.RAIN_POEMS || []).forEach(function (poem) {
+      var h = document.createElement('h2');
+      h.textContent = poem.title;
+      frag.appendChild(h);
+      var pre = document.createElement('p');
+      pre.textContent = poem.lines.join('\n');
+      pre.style.whiteSpace = 'pre-line';
+      frag.appendChild(pre);
+    });
+    host.appendChild(frag);
+  }
+
+  function start() {
+    engine = window.RainScene.create(canvas, {
+      poems: window.RAIN_POEMS,
+      families: {
+        poem: '"PoemKai", "KaiTi", "STKaiti", "Kaiti SC", serif',
+        title: '"TitleXing", "STXingkai", "KaiTi", serif',
+        fallback: '"KaiTi", "STKaiti", "Kaiti SC", serif'
+      },
+      reducedMotion: reduced
+    });
+    var v = readViewport();
+    var info = engine.resize(v.w, v.h, v.dpr);
+    applyLayout(info);
+    if (forcedLevel !== null) engine.setElapsed(window.RainScene.timeForLevel(forcedLevel));
+    else if (forcedT !== null) engine.setElapsed(forcedT);
+    engine.simulate(still ? 6 : 3.2);
+    canvas.classList.add('ready');
+    window.__rainEngine = engine;
+    buildLibretto();
+    window.addEventListener('resize', debounce(resize, 220), { passive: true });
+    window.addEventListener('orientationchange', debounce(resize, 320), { passive: true });
+    window.addEventListener('scroll', function () { engine.setScroll(window.scrollY || 0); }, { passive: true });
+    document.addEventListener('visibilitychange', function () { last = 0; });
+    running = true;
+    requestAnimationFrame(frame);
+  }
+
+  function debounce(fn, ms) {
+    var id = 0;
+    return function () {
+      clearTimeout(id);
+      id = setTimeout(fn, ms);
+    };
+  }
+
+  var ready = Promise.resolve();
+  if (document.fonts && document.fonts.load) {
+    ready = Promise.all([
+      document.fonts.load('20px PoemKai', '恨逝水纂事近'),
+      document.fonts.load('20px TitleXing', '恨逝水纂事近')
+    ]);
+  }
+  var guard = new Promise(function (r) { setTimeout(r, 2500); });
+  Promise.race([ready, guard]).then(start).catch(start);
+})();
+</script>
+</body>
+</html>
