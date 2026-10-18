@@ -584,6 +584,7 @@
     var surge = 0, surgeVel = 0;
     var density = 1, avgDt = 16;
     var postLayer = null, waterStrip = null, glowCool = null, glowWarm = null;
+    var foamSeeds = [], silt = [], riseRate = 0, tearScale = 1;
 
     function levelFor(sec) {
       if (sec <= conf.poolAt) return 0;
@@ -669,6 +670,24 @@
       var n = Math.max(48, Math.ceil(w / profileStep) + 1);
       profile = new Float32Array(n);
       if (!noiseTile) noiseTile = buildNoise();
+      // 浪花碎沫：位置、长度、弧高都预生成，运行时只做漂移
+      foamSeeds.length = 0;
+      var fr = makeRand(seed + 331);
+      for (var fi = 0; fi < 54; fi++) {
+        foamSeeds.push({
+          u: fr(), len: 8 + fr() * 42, arc: 0.6 + fr() * 2.6,
+          drift: 0.010 + fr() * 0.026, h: fr() * 2.2
+        });
+      }
+      // 水下悬浮细屑
+      silt.length = 0;
+      var sr = makeRand(seed + 517);
+      for (var si = 0; si < 110; si++) {
+        silt.push({
+          x: sr(), d: sr(), r: 0.5 + sr() * 1.5,
+          ph: sr() * TAU, sp: 0.4 + sr() * 1.2
+        });
+      }
       glowCool = buildGlow(178, 226, 224);
       glowWarm = buildGlow(234, 170, 92);
       postLayer = buildPostLayer();
@@ -742,9 +761,11 @@
       mainCtx = ctx;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       if (isFinite(conf.crackAt)) {
-        tearCanvas = makeCanvas(canvas.width, canvas.height);
+        // 撕裂是画面的尾声，内部按像素预算降一档渲染，再放大贴回，省下大量逐片拷贝
+        tearScale = Math.min(dpr, Math.sqrt(9.5e5 / (w * h)));
+        tearCanvas = makeCanvas(Math.max(1, Math.round(w * tearScale)), Math.max(1, Math.round(h * tearScale)));
         tearCtx = tearCanvas.getContext('2d');
-        tearCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        tearCtx.setTransform(tearScale, 0, 0, tearScale, 0, 0);
         fragments = buildFragments();
       }
       rebuild();
@@ -886,6 +907,7 @@
       level = levelFor(t);
       // 水位上升时给水面一点“水势”：弹簧式滞后与回弹 + 升水带来的推出涟漪
       var dLevel = (level - prev) / Math.max(dt, 0.0001);
+      riseRate = riseRate * 0.90 + clamp(dLevel, 0, 0.35) * 0.10;
       surgeVel += (dLevel * 150 - surge * 4.6 - surgeVel * 2.6) * dt;
       surge = clamp(surge + surgeVel * dt, -7, 10);
       if (level > prev && level > 0.001 && ripples.length < 34 && rand() < 0.55) {
@@ -1059,36 +1081,118 @@
       return edges;
     }
 
+    /* 撕口毛边：沿多边形采点，记下向外的短纤 */
+    function makeFringe(poly, rnd) {
+      var hairs = [];
+      var count = poly.length;
+      for (var i = 0; i < count; i++) {
+        var a = poly[i], b = poly[(i + 1) % count];
+        var dx = b[0] - a[0], dy = b[1] - a[1];
+        var len = Math.sqrt(dx * dx + dy * dy) || 1;
+        var n = Math.max(1, Math.round(len / 13));
+        var nx = dy / len, ny = -dx / len;
+        for (var k = 0; k < n; k++) {
+          var s = (k + rnd()) / n;
+          var long = rnd() < 0.12 ? 2.4 : 1;
+          hairs.push({
+            x: a[0] + dx * s,
+            y: a[1] + dy * s,
+            nx: nx * (0.55 + rnd() * 0.9) + (rnd() - 0.5) * 0.5,
+            ny: ny * (0.55 + rnd() * 0.9) + (rnd() - 0.5) * 0.5,
+            len: (1.6 + rnd() * 5.2) * long
+          });
+        }
+      }
+      return hairs;
+    }
+
+    /* 半平面裁剪：保留离 a 更近的一侧，用来切出 Voronoi 碎块 */
+    function clipPoly(poly, ax, ay, bx, by) {
+      var mx = (ax + bx) / 2, my = (ay + by) / 2;
+      var nx = bx - ax, ny = by - ay;
+      var out = [];
+      for (var i = 0; i < poly.length; i++) {
+        var p = poly[i], q = poly[(i + 1) % poly.length];
+        var dp = (p[0] - mx) * nx + (p[1] - my) * ny;
+        var dq = (q[0] - mx) * nx + (q[1] - my) * ny;
+        if (dp <= 0) out.push(p);
+        if ((dp < 0 && dq > 0) || (dp > 0 && dq < 0)) {
+          var tt = dp / (dp - dq);
+          out.push([p[0] + (q[0] - p[0]) * tt, p[1] + (q[1] - p[1]) * tt]);
+        }
+      }
+      return out;
+    }
+
+    /* 把直线边打散成参差不齐的撕口，只向外扩，不咬进碎块本体 */
+    function jagPoly(poly, rnd, amp) {
+      var out = [];
+      for (var i = 0; i < poly.length; i++) {
+        var a = poly[i], b = poly[(i + 1) % poly.length];
+        var dx = b[0] - a[0], dy = b[1] - a[1];
+        var len = Math.sqrt(dx * dx + dy * dy) || 1;
+        var steps = Math.max(1, Math.round(len / 15));
+        var nx = dy / len, ny = -dx / len;
+        for (var k = 0; k < steps; k++) {
+          var s = k / steps;
+          var off = (0.15 + rnd() * 0.85) * amp;
+          out.push([a[0] + dx * s + nx * off, a[1] + dy * s + ny * off]);
+        }
+      }
+      return out;
+    }
+
     function buildFragments() {
       var rnd = makeRand(seed + 909);
-      var cols = clamp(Math.round(w / 172), 4, 12);
-      var rows = clamp(Math.round(h / 172), 3, 9);
-      var xs = splitAxis(w, cols, rnd, 1.5);
-      var ys = splitAxis(h, rows, rnd, 1.5);
+      var cols = clamp(Math.round(w / 230), 4, 8);
+      var rows = clamp(Math.round(h / 230), 3, 6);
+      var xs = splitAxis(w, cols, rnd, 1.7);
+      var ys = splitAxis(h, rows, rnd, 1.7);
+      var seeds = [];
+      for (var r = 0; r < rows; r++) {
+        for (var c = 0; c < cols; c++) {
+          seeds.push({
+            x: lerp(xs[c], xs[c + 1], 0.25 + rnd() * 0.5),
+            y: lerp(ys[r], ys[r + 1], 0.25 + rnd() * 0.5)
+          });
+        }
+      }
       // 裂口起点：撕裂从这里一点点蔓延开
       var originX = w * (0.30 + rnd() * 0.40);
       var originY = h * (0.52 + rnd() * 0.36);
       var far = Math.sqrt(w * w + h * h);
       var list = [];
-      for (var r = 0; r < rows; r++) {
-        for (var c = 0; c < cols; c++) {
-          var x0 = xs[c], x1 = xs[c + 1];
-          var y0 = ys[r], y1 = ys[r + 1];
-          var amp = Math.min(13, (x1 - x0) * 0.12, (y1 - y0) * 0.12);
-          var cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-          var ox = (cx - w / 2) / (w / 2), oy = (cy - h / 2) / (h / 2);
-          list.push({
-            poly: jaggedRect(x0, y0, x1, y1, rnd, amp * 1.8),
-            cx: cx, cy: cy,
-            vx: ox * (30 + rnd() * 52) + (rnd() - 0.5) * 34,
-            vy: oy * (20 + rnd() * 38) + 18 + rnd() * 34,
-            rot: (rnd() - 0.5) * 0.9,
-            alpha: 0.72 + rnd() * 0.28,
-            delay: clamp(
-              Math.sqrt((cx - originX) * (cx - originX) + (cy - originY) * (cy - originY)) / far * 1.26
-              + (rnd() - 0.5) * 0.13, 0, 0.68)
-          });
+      for (var i = 0; i < seeds.length; i++) {
+        var cell = [[0, 0], [w, 0], [w, h], [0, h]];
+        for (var j = 0; j < seeds.length && cell.length >= 3; j++) {
+          if (j === i) continue;
+          cell = clipPoly(cell, seeds[i].x, seeds[i].y, seeds[j].x, seeds[j].y);
         }
+        if (cell.length < 3) continue;
+        var poly = jagPoly(cell, rnd, 9 + rnd() * 9);
+        var x0 = w, y0 = h, x1 = 0, y1 = 0, sx = 0, sy = 0;
+        for (var k = 0; k < poly.length; k++) {
+          x0 = Math.min(x0, poly[k][0]); y0 = Math.min(y0, poly[k][1]);
+          x1 = Math.max(x1, poly[k][0]); y1 = Math.max(y1, poly[k][1]);
+          sx += poly[k][0]; sy += poly[k][1];
+        }
+        var cx = sx / poly.length, cy = sy / poly.length;
+        var ox = (cx - w / 2) / (w / 2), oy = (cy - h / 2) / (h / 2);
+        list.push({
+          poly: poly,
+          cx: cx, cy: cy,
+          bx0: x0, by0: y0, bx1: x1, by1: y1,
+          vx: ox * (30 + rnd() * 52) + (rnd() - 0.5) * 34,
+          vy: oy * (20 + rnd() * 38) + 18 + rnd() * 34,
+          rot: (rnd() - 0.5) * 0.9,
+          tilt: (rnd() - 0.5) * 0.10,
+          tone: 0.80 + rnd() * 0.40,
+          alpha: 0.72 + rnd() * 0.28,
+          fringe: makeFringe(poly, rnd),
+          delay: clamp(
+            Math.sqrt((cx - originX) * (cx - originX) + (cy - originY) * (cy - originY)) / far * 1.26
+            + (rnd() - 0.5) * 0.13, 0, 0.68)
+        });
       }
       return list;
     }
@@ -1111,29 +1215,88 @@
         var shrink = 1 - 0.07 * local;
         var a = f.alpha * (1 - 0.5 * Math.pow(local, 0.8)) + 0.05 * local;
         if (a <= 0.02) continue;
+        var poly = f.poly;
+        // 离开画面之后才有投影：碎片之间有前后层次
+        if (drift > 0.02) {
+          ctx.save();
+          ctx.globalAlpha = Math.min(0.5, drift * 0.45) * a;
+          ctx.translate(f.cx + f.vx * drift * 1.10, f.cy + f.vy * drift * 1.10 + 6 * drift);
+          ctx.rotate(f.rot * drift * 0.55);
+          ctx.scale(shrink, shrink);
+          ctx.translate(-f.cx, -f.cy);
+          ctx.beginPath();
+          ctx.moveTo(poly[0][0], poly[0][1]);
+          for (var sj = 1; sj < poly.length; sj++) ctx.lineTo(poly[sj][0], poly[sj][1]);
+          ctx.closePath();
+          ctx.fillStyle = '#000';
+          ctx.fill();
+          ctx.restore();
+        }
         ctx.save();
         ctx.globalAlpha = Math.min(1, a);
         ctx.translate(f.cx + f.vx * drift, f.cy + f.vy * drift);
-        ctx.rotate(f.rot * drift * 0.55);
-        ctx.scale(shrink, shrink);
+        ctx.rotate(f.rot * drift * 0.55 + f.tilt * local);
+        // 微微压扁 + 拉伸：纸帛离开平面后的那点透视
+        ctx.scale(shrink * (1 + 0.012 * local), shrink * (1 - 0.030 * local));
         ctx.translate(-f.cx, -f.cy);
-        var poly = f.poly;
         ctx.beginPath();
         ctx.moveTo(poly[0][0], poly[0][1]);
         for (var j = 1; j < poly.length; j++) ctx.lineTo(poly[j][0], poly[j][1]);
         ctx.closePath();
         ctx.clip();
-        ctx.drawImage(src, 0, 0, src.width, src.height, 0, 0, w, h);
+        // 只拷贝碎片包围盒内的像素：整屏拷贝在低端设备上撑不住
+        var bw = f.bx1 - f.bx0 + 4, bh = f.by1 - f.by0 + 4;
+        var kk = src.width / w;
+        ctx.drawImage(src, (f.bx0 - 2) * kk, (f.by0 - 2) * kk, bw * kk, bh * kk,
+          f.bx0 - 2, f.by0 - 2, bw, bh);
         if (ease > 0.005) {
-          ctx.fillStyle = 'rgba(74,48,30,' + (0.42 * ease).toFixed(3) + ')';
-          ctx.fillRect(0, 0, w, h);
-          ctx.globalCompositeOperation = 'lighter';
-          ctx.fillStyle = 'rgba(40,33,23,' + (0.78 * ease).toFixed(3) + ')';
-          ctx.fillRect(0, 0, w, h);
-          ctx.globalCompositeOperation = 'source-over';
-          ctx.strokeStyle = 'rgba(238,226,198,' + (0.38 * ease * f.alpha).toFixed(3) + ')';
-          ctx.lineWidth = 1.3;
+          // 帛面：上亮下暗的体积感、每块略不同的旧色、极细的纤维颗粒
+          var tn = f.tone;
+          var tg = ctx.createLinearGradient(0, f.cy - 90, 0, f.cy + 90);
+          tg.addColorStop(0, 'rgba(' + Math.round(64 * tn) + ',' + Math.round(50 * tn) + ',' + Math.round(34 * tn) + ',' + (0.26 * ease).toFixed(3) + ')');
+          tg.addColorStop(0.55, 'rgba(' + Math.round(32 * tn) + ',' + Math.round(27 * tn) + ',' + Math.round(21 * tn) + ',' + (0.30 * ease).toFixed(3) + ')');
+          tg.addColorStop(1, 'rgba(6,8,9,' + (0.52 * ease).toFixed(3) + ')');
+          ctx.fillStyle = tg;
+          ctx.fillRect(f.bx0 - 60, f.by0 - 60, f.bx1 - f.bx0 + 120, f.by1 - f.by0 + 120);
+          // 断口内侧的阴影：让撕开的边有厚度
+          ctx.strokeStyle = 'rgba(0,3,4,' + (0.46 * ease).toFixed(3) + ')';
+          ctx.lineWidth = 9;
+          ctx.lineJoin = 'round';
           ctx.stroke();
+          // 光从左上来：迎光的断口起一道薄薄的卷边高光
+          ctx.beginPath();
+          for (var ei = 0; ei < poly.length; ei++) {
+            var pA = poly[ei], pB = poly[(ei + 1) % poly.length];
+            var edx = pB[0] - pA[0], edy = pB[1] - pA[1];
+            var el = Math.sqrt(edx * edx + edy * edy) || 1;
+            var nx2 = edy / el, ny2 = -edx / el;
+            if (nx2 * -0.60 + ny2 * -0.80 > 0.12) {
+              ctx.moveTo(pA[0], pA[1]);
+              ctx.lineTo(pB[0], pB[1]);
+            }
+          }
+          ctx.strokeStyle = 'rgba(255,242,212,' + (0.26 * ease).toFixed(3) + ')';
+          ctx.lineWidth = 5;
+          ctx.stroke();
+          // 断口的帛纤维亮边
+          ctx.strokeStyle = 'rgba(238,226,198,' + (0.34 * ease * f.alpha).toFixed(3) + ')';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+          ctx.strokeStyle = 'rgba(255,244,214,' + (0.15 * ease * f.alpha).toFixed(3) + ')';
+          ctx.lineWidth = 0.6;
+          ctx.stroke();
+          if (f.fringe && ease > 0.02) {
+            ctx.beginPath();
+            var fl = clamp(ease * 1.3, 0, 1);
+            for (var hi = 0; hi < f.fringe.length; hi++) {
+              var hr = f.fringe[hi];
+              ctx.moveTo(hr.x, hr.y);
+              ctx.lineTo(hr.x + hr.nx * hr.len * fl, hr.y + hr.ny * hr.len * fl);
+            }
+            ctx.strokeStyle = 'rgba(226,208,176,' + (0.32 * ease).toFixed(3) + ')';
+            ctx.lineWidth = 0.9;
+            ctx.stroke();
+          }
         }
         // 尚未松开的碎片：沿撕口慢慢长出一道暗裂纹
         var reveal = clamp((p - f.delay * 0.60) / 0.085, 0, 1);
@@ -1178,12 +1341,35 @@
       g.addColorStop(1, 'rgba(196,228,226,0.15)');
       ctx.fillStyle = g;
       ctx.fillRect(0, Math.max(0, y - 46), w, Math.min(h, 48));
-      ctx.beginPath();
-      ctx.moveTo(0, y - 0.5);
-      ctx.lineTo(w, y - 0.5);
-      ctx.strokeStyle = 'rgba(206,236,234,' + (level > 0.002 ? 0.30 : 0.24) + ')';
-      ctx.lineWidth = 1;
-      ctx.stroke();
+      if (level > 0.002) {
+        // 水面线上方的一层湿膜，随波起伏
+        var wn = profile.length;
+        ctx.beginPath();
+        ctx.moveTo(-3, profile[0] - 9);
+        for (var wi = 1; wi < wn; wi++) ctx.lineTo(wi * profileStep, profile[wi] - 9);
+        for (var wj = wn - 1; wj >= 0; wj--) ctx.lineTo(wj * profileStep, profile[wj]);
+        ctx.closePath();
+        var wetG = ctx.createLinearGradient(0, y - 18, 0, y + 4);
+        wetG.addColorStop(0, 'rgba(178,214,214,0)');
+        wetG.addColorStop(1, 'rgba(190,226,226,' + (0.09 + 0.10 * Math.min(1, level * 4)).toFixed(3) + ')');
+        ctx.fillStyle = wetG;
+        ctx.fill();
+        // 水线沿着波形走：湿痕压暗，上方留一道很薄的反光
+        waterPath();
+        ctx.strokeStyle = 'rgba(3,10,12,' + (0.26 + 0.18 * Math.min(1, level * 3)).toFixed(3) + ')';
+        ctx.lineWidth = 2.4;
+        ctx.stroke();
+        ctx.strokeStyle = 'rgba(206,236,234,0.10)';
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.moveTo(0, y - 0.5);
+        ctx.lineTo(w, y - 0.5);
+        ctx.strokeStyle = 'rgba(206,236,234,0.24)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
     }
 
     function drawWaterBody() {
@@ -1225,6 +1411,24 @@
           ctx.lineWidth = 1.4 + li * 0.25;
           ctx.stroke();
         }
+        // 斜射下来的水下光柱
+        for (var shi = 0; shi < 2; shi++) {
+          var sx = w * (0.22 + 0.42 * shi) + Math.sin(animT * 0.05 + shi * 1.7) * w * 0.045;
+          drawGlow(glowCool, sx, waterY + depth * 0.55, w * 0.085, depth * 0.42,
+            0.05 * (0.4 + level * 0.6), 0.10 + shi * 0.05);
+        }
+        // 悬浮细屑
+        ctx.beginPath();
+        for (var pi = 0; pi < silt.length; pi++) {
+          var sp = silt[pi];
+          var px = ((sp.x + animT * 0.02 * sp.sp) % 1) * w;
+          var py = waterY + depth * (0.06 + 0.9 * sp.d) + Math.sin(animT * 0.35 * sp.sp + sp.ph) * 6;
+          var pr = sp.r * (0.7 + 0.5 * sp.d);
+          ctx.moveTo(px + pr, py);
+          ctx.arc(px, py, pr, 0, TAU);
+        }
+        ctx.fillStyle = 'rgba(198,222,216,0.05)';
+        ctx.fill();
         ctx.restore();
       }
     }
@@ -1255,7 +1459,7 @@
       // 水面涨到视口顶端后不再描浪花线：贴着屏幕边缘的白线看着像噪点
       var edge = clamp(waterY / 22, 0, 1);
       if (edge <= 0.02) return;
-      var energy = clamp((0.25 + 0.75 * level) * (0.5 + 0.5 * conf.wave), 0, 1.4);
+      var energy = clamp((0.25 + 0.75 * level) * (0.5 + 0.5 * conf.wave) + Math.min(0.55, riseRate * 1.8), 0, 1.6);
       // 浪面下的暗带：让水面有体积
       ctx.beginPath();
       for (var i = 0; i < profile.length; i++) {
@@ -1273,6 +1477,27 @@
       ctx.strokeStyle = 'rgba(206,238,236,' + ((0.16 + 0.30 * Math.min(1, level * 6)) * edge).toFixed(3) + ')';
       ctx.lineWidth = 1.2;
       ctx.stroke();
+
+      // 浪花碎沫：被风推着沿水面漂的短弧
+      ctx.beginPath();
+      var foamN = 0;
+      for (var fi = 0; fi < foamSeeds.length; fi++) {
+        var fm = foamSeeds[fi];
+        var fu = (fm.u + animT * fm.drift * (0.7 + level * 0.9)) % 1.12;
+        var fx = fu * w * 1.12 - w * 0.06;
+        if (fx < -40 || fx > w + 40) continue;
+        var fy = surfaceAt(fx) - 0.6 - fm.h;
+        var fl = fm.len * (0.55 + 0.7 * energy);
+        ctx.moveTo(fx, fy);
+        ctx.quadraticCurveTo(fx + fl * 0.45, fy - fm.arc, fx + fl, fy + 0.8);
+        foamN++;
+      }
+      if (foamN) {
+        ctx.strokeStyle = 'rgba(233,248,246,' + ((0.06 + 0.14 * energy) * edge).toFixed(3) + ')';
+        ctx.lineWidth = 1.0;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+      }
 
       // 陡面上的反光：波越陡越亮，像风吹过浪尖
       ctx.beginPath();
@@ -1561,7 +1786,8 @@
       updateSurface();
       var p = tearProgress();
       ctx = (p > 0 && tearCtx) ? tearCtx : mainCtx;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      var sceneScale = ctx === tearCtx ? tearScale : dpr;
+      ctx.setTransform(sceneScale, 0, 0, sceneScale, 0, 0);
       ctx.globalCompositeOperation = 'source-over';
       ctx.globalAlpha = 1;
       drawScene();
